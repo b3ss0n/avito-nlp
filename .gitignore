@@ -1,0 +1,14 @@
+# данные и результаты
+dataset/
+cache/
+answer*.csv
+
+# python
+__pycache__/
+*.pyc
+.venv/
+.ipynb_checkpoints/
+
+# ide
+.vscode/
+.idea/
