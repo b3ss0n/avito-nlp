@@ -12,9 +12,7 @@ dependencies = [
     "snowballstemmer>=2.2",
     "tqdm>=4.66",
     "ipykernel>=6.29",
-    "sentence-transformers>=3.0",
     "transformers>=4.41",
-    "torch>=2.3",
     "catboost>=1.2",
     "huggingface-hub>=0.23",
 ]
