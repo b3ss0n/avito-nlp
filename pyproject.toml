@@ -15,4 +15,6 @@ dependencies = [
     "transformers>=4.41",
     "catboost>=1.2",
     "huggingface-hub>=0.23",
+    "torch>=2.14.0",
+    "sentence-transformers>=6.1.0",
 ]

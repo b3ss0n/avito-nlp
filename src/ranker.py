@@ -31,6 +31,7 @@ from catboost import CatBoostClassifier
 
 from src.bm25 import TOP_K, check_answer
 from src.candidates import add_labels, generate, location_centroids
+from src.embeddings import add_emb_feature
 from src.validation import CACHE, build_split, corpus_mask, recall_at_k
 
 N_RANKER_QUERIES = 6000
@@ -39,7 +40,7 @@ FEATURES = [
     "bm25_title", "bm25_params", "bm25_desc",
     "same_loc", "dist_km", "rating", "reviews", "log_price",
     "phone_hidden", "msg_forbidden", "title_len", "desc_len", "n_clones", "microcat",
-    "mc_prob", "mc_rel",
+    "mc_prob", "mc_rel", "emb_cos",
 ]
 CAT_FEATURES = ["microcat"]
 
@@ -129,6 +130,7 @@ def main(mode: str) -> None:
     # q в cands_eval - номер запроса в concat([rq, val]), как при генерации пула
     cands = add_microcat_feature(pd.read_parquet(CACHE / "cands_eval.parquet"),
                                  pd.concat([rq, val], ignore_index=True))
+    cands = add_emb_feature(cands, "emb_q_eval.npy")
 
     if mode == "val":
         model = train_model(cands[~cands.is_val])
@@ -146,6 +148,7 @@ def main(mode: str) -> None:
         model = train_model(cands)
         bench = pd.read_parquet(CACHE / "queries.parquet")
         bench_cands = add_microcat_feature(pd.read_parquet(CACHE / "cands_bench.parquet"), bench)
+        bench_cands = add_emb_feature(bench_cands, "emb_q_bench.npy")
         preds = top50(bench_cands, model, len(bench))
         answer = pd.DataFrame({"query_id": bench.query_id, "answer": [" ".join(p) for p in preds]})
         answer.to_csv("answer.csv", index=False)
