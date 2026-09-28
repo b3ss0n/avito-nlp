@@ -19,6 +19,9 @@ from src.bm25 import FIELDS, TOP_K_FIELD, rrf, top_positive
 
 LOCAL_N = 300   # сколько кандидатов берём из локальной выдачи
 GLOBAL_N = 100  # и сколько из глобальной
+NEAR_N = 100    # и сколько из соседних локаций
+NEAR_KM = 100   # радиус "соседних" локаций: медиана расстояния до правильных
+                # ответов из чужой локации - 39 км, 75-й перцентиль - 149 км
 NO_RANK = 10_000  # "место" для кандидата, которого нет в данной выдаче
 
 
@@ -49,6 +52,26 @@ def generate(items: pd.DataFrame, queries: pd.DataFrame, centroids: pd.DataFrame
         retrievers[f].index(items[f].str.split().tolist(), show_progress=False)
     loc_positions = items.groupby("item_location_id").indices
     title_tokens = items.title_norm.str.split().map(set).to_numpy()
+    item_lat = items.item_latitude.to_numpy(dtype=float)
+    item_lon = items.item_longitude.to_numpy(dtype=float)
+    item_loc = items.item_location_id.to_numpy()
+    near_cache = {}
+
+    def near_positions(loc) -> np.ndarray:
+        """Объявления в радиусе NEAR_KM от центра локации, кроме самой локации.
+
+        Разбор промахов пула: 9% правильных ответов лексически находятся, но
+        лежат в соседней локации (область, город-спутник), а глобальный топ-100
+        до них не дотягивается - его забивают клоны со всей страны.
+        """
+        if loc not in near_cache:
+            if loc in centroids.index:
+                lat, lon = centroids.loc[loc]
+                dist = haversine_km(lat, lon, item_lat, item_lon)
+                near_cache[loc] = np.flatnonzero((dist <= NEAR_KM) & (item_loc != loc))
+            else:  # в корпусе нет объявлений из этой локации - центр неизвестен
+                near_cache[loc] = np.array([], dtype=int)
+        return near_cache[loc]
 
     parts = []
     for qi, (tokens, loc) in enumerate(tqdm(
@@ -62,12 +85,16 @@ def generate(items: pd.DataFrame, queries: pd.DataFrame, centroids: pd.DataFrame
         pos = loc_positions.get(loc, np.array([], dtype=int))
         local = rrf([pos[top_positive(s[pos], TOP_K_FIELD)].tolist() for s in field_scores])
 
-        local, glob = local[:LOCAL_N], glob[:GLOBAL_N]
-        cand = np.array(list(dict.fromkeys(local + glob)), dtype=int)
+        npos = near_positions(loc)
+        near = rrf([npos[top_positive(s[npos], TOP_K_FIELD)].tolist() for s in field_scores])
+
+        local, glob, near = local[:LOCAL_N], glob[:GLOBAL_N], near[:NEAR_N]
+        cand = np.array(list(dict.fromkeys(local + near + glob)), dtype=int)
         if len(cand) == 0:  # ни одного совпавшего слова ни в одном поле
             continue
         local_rank = {d: r for r, d in enumerate(local)}
         glob_rank = {d: r for r, d in enumerate(glob)}
+        near_rank = {d: r for r, d in enumerate(near)}
 
         qset = set(tokens)
         df = pd.DataFrame({
@@ -75,7 +102,9 @@ def generate(items: pd.DataFrame, queries: pd.DataFrame, centroids: pd.DataFrame
             "pos": cand,
             "local_rank": [local_rank.get(d, NO_RANK) for d in cand],
             "global_rank": [glob_rank.get(d, NO_RANK) for d in cand],
+            "near_rank": [near_rank.get(d, NO_RANK) for d in cand],
             "n_local": len(local),
+            "n_near": len(near),
             "q_ntok": len(tokens),
             # доля слов запроса, которые есть в заголовке: 1.0 = все слова совпали
             "title_cover": [len(qset & title_tokens[d]) / len(qset) for d in cand],

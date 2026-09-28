@@ -35,10 +35,11 @@ from src.validation import CACHE, build_split, corpus_mask, recall_at_k
 
 N_RANKER_QUERIES = 6000
 FEATURES = [
-    "local_rank", "global_rank", "n_local", "q_ntok", "title_cover",
+    "local_rank", "global_rank", "near_rank", "n_local", "n_near", "q_ntok", "title_cover",
     "bm25_title", "bm25_params", "bm25_desc",
     "same_loc", "dist_km", "rating", "reviews", "log_price",
     "phone_hidden", "msg_forbidden", "title_len", "desc_len", "n_clones", "microcat",
+    "mc_prob", "mc_rel",
 ]
 CAT_FEATURES = ["microcat"]
 
@@ -67,6 +68,36 @@ def build_pools() -> None:
     generate(corpus, bench, centroids).to_parquet(CACHE / "cands_bench.parquet", index=False)
 
 
+def add_microcat_feature(cands: pd.DataFrame, queries: pd.DataFrame) -> pd.DataFrame:
+    """Насколько подкатегория кандидата подходит запросу.
+
+    По train считаем P(microcat | слово запроса): по слову "холодильник" выбирают
+    в основном "ремонт техники", по "квартира" - "ремонт и отделку". Для запроса
+    усредняем по его словам, для кандидата берём вероятность его подкатегории:
+      mc_prob - сама вероятность,
+      mc_rel  - она же, делённая на максимум по подкатегориям запроса
+                (1.0 = самая типичная подкатегория для этого запроса).
+    Статистики - по train_stats, где нет сессий ни обучающих запросов ранкера,
+    ни валидации, иначе признак содержал бы правильный ответ (утечка таргета).
+    """
+    stats = pd.read_parquet(CACHE / "train_stats.parquet", columns=["query_norm", "item_microcat_id"])
+    tok_mc = (stats.assign(tok=stats.query_norm.str.split()).explode("tok")
+              .groupby(["tok", "item_microcat_id"]).size().rename("n").reset_index())
+    tok_mc["p"] = tok_mc.n / tok_mc.groupby("tok").n.transform("sum")
+
+    q_tok = pd.DataFrame({"q": range(len(queries)), "tok": queries.query_norm.str.split()}).explode("tok")
+    q_tok["n_tok"] = q_tok.groupby("q").tok.transform("size")
+    q_mc = q_tok.merge(tok_mc[["tok", "item_microcat_id", "p"]], on="tok")
+    q_mc["p"] /= q_mc.n_tok  # среднее по словам запроса (незнакомые слова дают 0)
+    q_mc = q_mc.groupby(["q", "item_microcat_id"]).p.sum().rename("mc_prob").reset_index()
+    q_mc["mc_rel"] = q_mc.mc_prob / q_mc.groupby("q").mc_prob.transform("max")
+
+    cands = cands.merge(q_mc.rename(columns={"item_microcat_id": "microcat"}),
+                        on=["q", "microcat"], how="left")
+    cands[["mc_prob", "mc_rel"]] = cands[["mc_prob", "mc_rel"]].fillna(0)
+    return cands
+
+
 def train_model(cands: pd.DataFrame) -> CatBoostClassifier:
     # запросы, где правильного ответа нет в пуле, ничему не учат - убираем
     has_pos = cands.groupby("q").target.transform("max") == 1
@@ -92,11 +123,14 @@ def main(mode: str) -> None:
         build_pools()
         return
 
-    cands = pd.read_parquet(CACHE / "cands_eval.parquet")
-    n_rq = len(pd.read_parquet(CACHE / "ranker_queries.parquet", columns=["query_id"]))
+    rq = pd.read_parquet(CACHE / "ranker_queries.parquet")
+    val = pd.read_parquet(CACHE / "val_queries.parquet")
+    n_rq = len(rq)
+    # q в cands_eval - номер запроса в concat([rq, val]), как при генерации пула
+    cands = add_microcat_feature(pd.read_parquet(CACHE / "cands_eval.parquet"),
+                                 pd.concat([rq, val], ignore_index=True))
 
     if mode == "val":
-        val = pd.read_parquet(CACHE / "val_queries.parquet")
         model = train_model(cands[~cands.is_val])
         val_cands = cands[cands.is_val].assign(q=lambda d: d.q - n_rq)
         preds = top50(val_cands, model, len(val))
@@ -111,7 +145,8 @@ def main(mode: str) -> None:
         # для финальной модели валидация - тоже обучающие данные: пул уже посчитан
         model = train_model(cands)
         bench = pd.read_parquet(CACHE / "queries.parquet")
-        preds = top50(pd.read_parquet(CACHE / "cands_bench.parquet"), model, len(bench))
+        bench_cands = add_microcat_feature(pd.read_parquet(CACHE / "cands_bench.parquet"), bench)
+        preds = top50(bench_cands, model, len(bench))
         answer = pd.DataFrame({"query_id": bench.query_id, "answer": [" ".join(p) for p in preds]})
         answer.to_csv("answer.csv", index=False)
         items = pd.read_parquet(CACHE / "items.parquet", columns=["item_id", "in_benchmark"])
