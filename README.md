@@ -135,12 +135,16 @@ uv sync                               # окружение (Python 3.12)
 uv run python -m src.prepare          # нормализация текстов -> cache/ (~7 мин)
 uv run python -m src.validation       # валидационное разбиение
 uv run python scripts/download_model.py  # один раз скачать e5 в models/ (дальше всё офлайн)
-uv run python -m src.ranker pools     # пулы кандидатов, только подготовка данных (~25 мин)
-uv run python -m src.embeddings       # эмбеддинги запросов и объявлений из пулов (~20 мин на CPU)
+uv run python -m src.ranker pools     # пулы кандидатов, только подготовка данных (~5 мин)
+uv run python -m src.embeddings       # эмбеддинги запросов и объявлений из пулов (~22 мин на CPU)
 uv run python -m src.ranker val       # обучение на запросах ранкера, Recall@50 на валидации (~6 мин)
 uv run python -m src.ranker submit    # обучение на всех размеченных запросах, answer.csv (~8 мин)
 uv run python -m src.bm25 val         # (опционально) бейзлайн BM25 + локация без ранкера
 ```
+
+Проверено полным прогоном в чистом клоне репозитория (6 CPU-потоков, без GPU):
+~50 минут от `uv sync` до `answer.csv`, Recall@50 на валидации совпал с
+исходным (0.8304).
 
 ## Структура
 
