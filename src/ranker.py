@@ -9,14 +9,23 @@
 кандидатов попадут в ответ, - в этом и прирост относительно простого правила
 "сначала всё локальное".
 
+Генерация пула - самая долгая часть (~15 мин), а от признаков и параметров
+модели она не зависит. Поэтому пул считается один раз и кэшируется:
+  cache/cands_eval.parquet   - пул для обучающих запросов ранкера + валидации
+                               (корпус: бенчмарк + правильные ответы обоих наборов)
+  cache/cands_bench.parquet  - пул для запросов бенчмарка (корпус: только бенчмарк)
+  cache/ranker_queries.parquet - обучающие запросы ранкера с разметкой
+  cache/train_stats.parquet  - train_part без сессий обучающих запросов ранкера
+                               (для статистик по train без утечки таргета)
+
 Запуск:
-  uv run python -m src.ranker val      # обучить на train_part, Recall@50 на валидации
-  uv run python -m src.ranker submit   # обучить и собрать answer.csv для бенчмарка
+  uv run python -m src.ranker pools    # посчитать и закэшировать пулы
+  uv run python -m src.ranker val      # обучить на запросах ранкера, Recall@50 на валидации
+  uv run python -m src.ranker submit   # обучить на запросах ранкера + валидации, answer.csv
 """
 
 import sys
 
-import numpy as np
 import pandas as pd
 from catboost import CatBoostClassifier
 
@@ -34,11 +43,28 @@ FEATURES = [
 CAT_FEATURES = ["microcat"]
 
 
-def ranker_queries() -> pd.DataFrame:
-    """Запросы с разметкой для обучения ранкера - из train_part, не из валидации."""
+def build_pools() -> None:
+    """Считает пулы кандидатов и сохраняет их в cache/."""
+    items = pd.read_parquet(CACHE / "items.parquet")
+    centroids = location_centroids(items)
+
+    # обучающие запросы ранкера - из train_part, т.е. заведомо не из валидации
     train_part = pd.read_parquet(CACHE / "train_part.parquet")
-    _, rq = build_split(train_part, n_val=N_RANKER_QUERIES, seed=7)
-    return rq
+    train_stats, rq = build_split(train_part, n_val=N_RANKER_QUERIES, seed=7)
+    rq.to_parquet(CACHE / "ranker_queries.parquet", index=False)
+    train_stats.to_parquet(CACHE / "train_stats.parquet", index=False)
+
+    # один корпус для обучающих запросов и валидации
+    val = pd.read_parquet(CACHE / "val_queries.parquet")
+    queries = pd.concat([rq, val], ignore_index=True)
+    corpus = items[corpus_mask(items, queries)].reset_index(drop=True)
+    cands = add_labels(generate(corpus, queries, centroids), queries)
+    cands["is_val"] = cands.q >= len(rq)
+    cands.to_parquet(CACHE / "cands_eval.parquet", index=False)
+
+    bench = pd.read_parquet(CACHE / "queries.parquet")
+    corpus = items[corpus_mask(items)].reset_index(drop=True)
+    generate(corpus, bench, centroids).to_parquet(CACHE / "cands_bench.parquet", index=False)
 
 
 def train_model(cands: pd.DataFrame) -> CatBoostClassifier:
@@ -62,35 +88,34 @@ def top50(cands: pd.DataFrame, model: CatBoostClassifier, n_queries: int) -> lis
 
 
 def main(mode: str) -> None:
-    items = pd.read_parquet(CACHE / "items.parquet")
-    centroids = location_centroids(items)
-    rq = ranker_queries()
+    if mode == "pools":
+        build_pools()
+        return
+
+    cands = pd.read_parquet(CACHE / "cands_eval.parquet")
+    n_rq = len(pd.read_parquet(CACHE / "ranker_queries.parquet", columns=["query_id"]))
 
     if mode == "val":
         val = pd.read_parquet(CACHE / "val_queries.parquet")
-        # один корпус для обучения ранкера и валидации: бенчмарк + правильные ответы обоих наборов
-        queries = pd.concat([rq, val], ignore_index=True)
-        corpus = items[corpus_mask(items, queries)].reset_index(drop=True)
-        cands = add_labels(generate(corpus, queries, centroids), queries)
-        is_rq = cands.q < len(rq)
-
-        model = train_model(cands[is_rq])
-        val_cands = cands[~is_rq].assign(q=lambda d: d.q - len(rq))
+        model = train_model(cands[~cands.is_val])
+        val_cands = cands[cands.is_val].assign(q=lambda d: d.q - n_rq)
         preds = top50(val_cands, model, len(val))
+        # потолок: Recall идеального ранкера = доля правильных ответов, попавших в пул
+        pool = val_cands.groupby("q").item_id.agg(list)
+        pools = [pool.get(i, []) for i in range(len(val))]
+        print(f"потолок пула: {recall_at_k(pools, val.relevant, k=10**6):.4f}")
         print(f"Recall@50 ranker: {recall_at_k(preds, val.relevant):.4f}")
         print(pd.Series(model.get_feature_importance(), index=FEATURES).sort_values(ascending=False).round(1))
 
     elif mode == "submit":
-        # ранкер учим на своём корпусе, применяем к пулу по корпусу бенчмарка
-        corpus = items[corpus_mask(items, rq)].reset_index(drop=True)
-        model = train_model(add_labels(generate(corpus, rq, centroids), rq))
-
+        # для финальной модели валидация - тоже обучающие данные: пул уже посчитан
+        model = train_model(cands)
         bench = pd.read_parquet(CACHE / "queries.parquet")
-        corpus = items[corpus_mask(items)].reset_index(drop=True)
-        preds = top50(generate(corpus, bench, centroids), model, len(bench))
+        preds = top50(pd.read_parquet(CACHE / "cands_bench.parquet"), model, len(bench))
         answer = pd.DataFrame({"query_id": bench.query_id, "answer": [" ".join(p) for p in preds]})
         answer.to_csv("answer.csv", index=False)
-        check_answer("answer.csv", bench, corpus)
+        items = pd.read_parquet(CACHE / "items.parquet", columns=["item_id", "in_benchmark"])
+        check_answer("answer.csv", bench, items[items.in_benchmark])
         print(f"answer.csv: {len(answer)} строк, пустых ответов: {(answer.answer == '').sum()}")
 
 
